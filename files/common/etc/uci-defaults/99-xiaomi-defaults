@@ -1,0 +1,22 @@
+# First boot defaults for the Xiaomi AX3000 (RA80) and AX1800 (RM1800) images.
+# uci-defaults also run after every sysupgrade that keeps the settings, so this
+# only touches values that are still at the OpenWrt default.
+
+# LAN on the stock Xiaomi address (192.168.31.1) instead of 192.168.1.1, which
+# often collides with the main router of the network.
+if [ "$(uci -q get network.lan.proto)" = static ] &&
+   [ "$(uci -q get network.lan.ipaddr)" = 192.168.1.1/24 ]; then
+	uci -q delete network.lan.ipaddr
+	uci add_list network.lan.ipaddr='192.168.31.1/24'
+	uci commit network
+fi
+
+# 802.11k and 802.11v on both radios, used by usteer to move clients between
+# bands and access points. Wi-Fi itself stays disabled until it is configured.
+for i in default_radio0 default_radio1; do
+	uci -q get wireless.$i >/dev/null || continue
+	uci -q get wireless.$i.ieee80211k >/dev/null || uci set wireless.$i.ieee80211k='1'
+	uci -q get wireless.$i.bss_transition >/dev/null || uci set wireless.$i.bss_transition='1'
+done
+uci commit wireless
+exit 0

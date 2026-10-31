@@ -1,0 +1,206 @@
+From 8edd2bbb002f57d2e668fe423963e8d9d0f02114 Mon Sep 17 00:00:00 2001
+From: Alle4you <56454046+Alle4you@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:59:07 -0300
+Subject: [PATCH 2/4] mac80211: ath11k: add low memory RX profile for FW memory
+ mode 2
+
+Boards that select FW memory mode 2 (256 MB of RAM) still get the RX
+rings sized for 1 GB boards, and their page_frag based RX buffers keep
+pinning memory until the OOM killer takes hostapd and netifd down.
+
+Shrink the RX refill and monitor rings and allocate one slab object
+per RX buffer when FW memory mode 2 is selected. Other modes are not
+affected. Details and measurements are in the patch description.
+
+Signed-off-by: Alle4you <56454046+Alle4you@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0131p3ppZXaVqXxtupLrRC2P
+---
+ ...mory-RX-profile-for-FW-memory-mode-2.patch | 175 ++++++++++++++++++
+ 1 file changed, 175 insertions(+)
+ create mode 100644 package/kernel/mac80211/patches/ath11k/950-wifi-ath11k-add-low-memory-RX-profile-for-FW-memory-mode-2.patch
+
+diff --git a/package/kernel/mac80211/patches/ath11k/950-wifi-ath11k-add-low-memory-RX-profile-for-FW-memory-mode-2.patch b/package/kernel/mac80211/patches/ath11k/950-wifi-ath11k-add-low-memory-RX-profile-for-FW-memory-mode-2.patch
+new file mode 100644
+index 0000000000..09089165e9
+--- /dev/null
++++ b/package/kernel/mac80211/patches/ath11k/950-wifi-ath11k-add-low-memory-RX-profile-for-FW-memory-mode-2.patch
+@@ -0,0 +1,175 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Alle4you <56454046+Alle4you@users.noreply.github.com>
++Date: Fri, 30 Oct 2026 08:58:10 -0300
++Subject: [PATCH] wifi: ath11k: add low memory RX profile for FW memory mode 2
++
++FW memory mode 2 is meant for boards with 256 MB of RAM, but the host
++side of ath11k keeps sizing its RX rings for boards with 1 GB or more.
++On IPQ6018 every radio fills three RX rings at init: the refill ring
++(4096 buffers), the monitor buffer ring (4096 buffers, unused unless a
++monitor interface is created) and the monitor status ring (1024
++buffers). That is roughly 45 MB for two radios on a board where Linux
++only gets about 157 MB.
++
++The buffers come from dev_alloc_skb(), which carves them out of 32 KiB
++page_frag pages. A page is only released after every buffer carved
++from it has been freed, and buffers can sit in the rings for a long
++time while the monitor status ring is refilled continuously. A few
++long-lived buffers end up pinning many pages, so memory usage keeps
++growing even on an idle AP.
++
++Measured on a Xiaomi AX1800 (IPQ6000, 256 MB) running as a bridged AP:
++memory outside slab, page cache and user space grew from 77 MB to
++101 MB in under five minutes. Most of it came with a client pulling
++8.5 MB, but between 303 s and 483 s of uptime it still grew by 8 MB
++while only about 130 KB crossed the LAN. The OOM killer started killing
++hostapd and netifd after about eight minutes. The watchdog keeps being
++fed, so the box stays up without network until it is power cycled.
++
++When the DT selects FW memory mode 2:
++- shrink the RX refill ring to 2048 entries and the monitor rings to
++  256/512/1024 entries (buffer/destination/descriptor);
++- allocate RX buffers with alloc_skb(), one slab object per buffer, so
++  freed buffers are reused and memory stays bounded by the ring sizes.
++
++Other memory modes are not affected.
++
++Signed-off-by: Alle4you <56454046+Alle4you@users.noreply.github.com>
++Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_0131p3ppZXaVqXxtupLrRC2P
++---
++ drivers/net/wireless/ath/ath11k/core.c  |  1 +
++ drivers/net/wireless/ath/ath11k/dp.h    |  8 ++++++
++ drivers/net/wireless/ath/ath11k/dp_rx.c | 33 +++++++++++++++++++------
++ drivers/net/wireless/ath/ath11k/hw.h    |  1 +
++ 4 files changed, 35 insertions(+), 8 deletions(-)
++
++diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
++index 6e0490b..671ebeb 100644
++--- a/drivers/net/wireless/ath/ath11k/core.c
+++++ b/drivers/net/wireless/ath/ath11k/core.c
++@@ -2675,6 +2675,7 @@ static int ath11k_init_hw_params(struct ath11k_base *ab)
++ 			ab->hw_params.num_peers = 128;
++ 			ab->hw_params.coldboot_cal_mm = false;
++ 			ab->hw_params.coldboot_cal_ftm = false;
+++			ab->hw_params.low_mem_rx = true;
++ 		} else
++ 			ath11k_info(ab, "Unsupported FW memory mode: %u\n", fw_mem_mode);
++ 	}
++diff --git a/drivers/net/wireless/ath/ath11k/dp.h b/drivers/net/wireless/ath/ath11k/dp.h
++index 7a55afd..34b1c8c 100644
++--- a/drivers/net/wireless/ath/ath11k/dp.h
+++++ b/drivers/net/wireless/ath/ath11k/dp.h
++@@ -225,6 +225,14 @@ struct ath11k_pdev_dp {
++ #define DP_RXDMA_MONITOR_DST_RING_SIZE	2048
++ #define DP_RXDMA_MONITOR_DESC_RING_SIZE	4096
++ 
+++/* Ring sizes used when hw_params.low_mem_rx is set (FW memory mode 2) */
+++#define ATH11K_DP_RX_RING_SIZE(ab, size) \
+++	((ab)->hw_params.low_mem_rx ? size##_LOW_MEM : (size))
+++#define DP_RXDMA_BUF_RING_SIZE_LOW_MEM		2048
+++#define DP_RXDMA_MONITOR_BUF_RING_SIZE_LOW_MEM	256
+++#define DP_RXDMA_MONITOR_DST_RING_SIZE_LOW_MEM	512
+++#define DP_RXDMA_MONITOR_DESC_RING_SIZE_LOW_MEM	1024
+++
++ #define DP_RX_RELEASE_RING_NUM	3
++ 
++ #define DP_RX_BUFFER_SIZE	2048
++diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
++index 44eea68..1525352 100644
++--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
+++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
++@@ -340,6 +340,21 @@ static int ath11k_dp_purge_mon_ring(struct ath11k_base *ab)
++ 	return -ETIMEDOUT;
++ }
++ 
+++static struct sk_buff *ath11k_dp_rx_alloc_buf_skb(struct ath11k_base *ab)
+++{
+++	/* dev_alloc_skb() carves RX buffers out of 32 KiB page_frag pages and
+++	 * a page is only released once every buffer carved from it has been
+++	 * freed. Buffers can stay in the RX rings for a long time, so a few
+++	 * of them end up pinning many pages and memory usage keeps growing.
+++	 * On low memory devices use one slab object per buffer instead.
+++	 */
+++	if (ab->hw_params.low_mem_rx)
+++		return alloc_skb(DP_RX_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE,
+++				 GFP_ATOMIC);
+++
+++	return dev_alloc_skb(DP_RX_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE);
+++}
+++
++ /* Returns number of Rx buffers replenished */
++ int ath11k_dp_rxbufs_replenish(struct ath11k_base *ab, int mac_id,
++ 			       struct dp_rxdma_ring *rx_ring,
++@@ -371,8 +386,7 @@ int ath11k_dp_rxbufs_replenish(struct ath11k_base *ab, int mac_id,
++ 	num_remain = req_entries;
++ 
++ 	while (num_remain > 0) {
++-		skb = dev_alloc_skb(DP_RX_BUFFER_SIZE +
++-				    DP_RX_BUFFER_ALIGN_SIZE);
+++		skb = ath11k_dp_rx_alloc_buf_skb(ab);
++ 		if (!skb)
++ 			break;
++ 
++@@ -578,7 +592,8 @@ static int ath11k_dp_rx_pdev_srng_alloc(struct ath11k *ar)
++ 	ret = ath11k_dp_srng_setup(ar->ab,
++ 				   &dp->rx_refill_buf_ring.refill_buf_ring,
++ 				   HAL_RXDMA_BUF, 0,
++-				   dp->mac_id, DP_RXDMA_BUF_RING_SIZE);
+++				   dp->mac_id,
+++				   ATH11K_DP_RX_RING_SIZE(ab, DP_RXDMA_BUF_RING_SIZE));
++ 	if (ret) {
++ 		ath11k_warn(ar->ab, "failed to setup rx_refill_buf_ring\n");
++ 		return ret;
++@@ -636,7 +651,8 @@ static int ath11k_dp_rx_pdev_srng_alloc(struct ath11k *ar)
++ 	ret = ath11k_dp_srng_setup(ar->ab,
++ 				   &dp->rxdma_mon_buf_ring.refill_buf_ring,
++ 				   HAL_RXDMA_MONITOR_BUF, 0, dp->mac_id,
++-				   DP_RXDMA_MONITOR_BUF_RING_SIZE);
+++				   ATH11K_DP_RX_RING_SIZE(ab,
+++							  DP_RXDMA_MONITOR_BUF_RING_SIZE));
++ 	if (ret) {
++ 		ath11k_warn(ar->ab,
++ 			    "failed to setup HAL_RXDMA_MONITOR_BUF\n");
++@@ -645,7 +661,8 @@ static int ath11k_dp_rx_pdev_srng_alloc(struct ath11k *ar)
++ 
++ 	ret = ath11k_dp_srng_setup(ar->ab, &dp->rxdma_mon_dst_ring,
++ 				   HAL_RXDMA_MONITOR_DST, 0, dp->mac_id,
++-				   DP_RXDMA_MONITOR_DST_RING_SIZE);
+++				   ATH11K_DP_RX_RING_SIZE(ab,
+++							  DP_RXDMA_MONITOR_DST_RING_SIZE));
++ 	if (ret) {
++ 		ath11k_warn(ar->ab,
++ 			    "failed to setup HAL_RXDMA_MONITOR_DST\n");
++@@ -654,7 +671,8 @@ static int ath11k_dp_rx_pdev_srng_alloc(struct ath11k *ar)
++ 
++ 	ret = ath11k_dp_srng_setup(ar->ab, &dp->rxdma_mon_desc_ring,
++ 				   HAL_RXDMA_MONITOR_DESC, 0, dp->mac_id,
++-				   DP_RXDMA_MONITOR_DESC_RING_SIZE);
+++				   ATH11K_DP_RX_RING_SIZE(ab,
+++							  DP_RXDMA_MONITOR_DESC_RING_SIZE));
++ 	if (ret) {
++ 		ath11k_warn(ar->ab,
++ 			    "failed to setup HAL_RXDMA_MONITOR_DESC\n");
++@@ -2838,8 +2856,7 @@ static struct sk_buff *ath11k_dp_rx_alloc_mon_status_buf(struct ath11k_base *ab,
++ 	struct sk_buff *skb;
++ 	dma_addr_t paddr;
++ 
++-	skb = dev_alloc_skb(DP_RX_BUFFER_SIZE +
++-			    DP_RX_BUFFER_ALIGN_SIZE);
+++	skb = ath11k_dp_rx_alloc_buf_skb(ab);
++ 
++ 	if (!skb)
++ 		goto fail_alloc_skb;
++diff --git a/drivers/net/wireless/ath/ath11k/hw.h b/drivers/net/wireless/ath/ath11k/hw.h
++index af04f9e..1dabedf 100644
++--- a/drivers/net/wireless/ath/ath11k/hw.h
+++++ b/drivers/net/wireless/ath/ath11k/hw.h
++@@ -196,6 +196,7 @@ struct ath11k_hw_params {
++ 	bool coldboot_cal_ftm;
++ 	bool cbcal_restart_fw;
++ 	int fw_mem_mode;
+++	bool low_mem_rx;
++ 	u32 num_vdevs;
++ 	u32 num_peers;
++ 	bool supports_suspend;
+-- 
+2.43.0
+

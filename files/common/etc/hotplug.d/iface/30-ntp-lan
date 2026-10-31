@@ -1,0 +1,4 @@
+# In access point mode there is no wan interface, which is what normally
+# triggers NTP. Without this the clock stays at the build date: restart
+# sysntpd when lan comes up.
+[ "$ACTION" = ifup ] && [ "$INTERFACE" = lan ] && /etc/init.d/sysntpd restart
