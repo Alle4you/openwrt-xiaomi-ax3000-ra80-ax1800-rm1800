@@ -177,10 +177,9 @@ Measured on the tested unit (one unit, 2026-10-30).
   dropped to 24.5 MB and `invis` rose to 73.5 MB (buffers in flight), with no
   OOM; one minute later `MemAvailable` was back at 66 MB. Memory rises during
   bursts and comes back when traffic stops.
-- **Longer run:** after a reboot at about 10:11 on 2026-10-30, a per-minute
-  memory log covered about 9 hours of uptime (32,904 s) with up to four clients:
-  no OOM, lowest `MemAvailable` 51.8 MB, highest `invis` 44.6 MB. An overnight
-  result was not available when this page was written.
+- **Longer run:** about 22 hours in operation as an access point, with up to
+  four clients and a per-minute memory log: no OOM, panic or reboot, lowest
+  `MemAvailable` 51.8 MB, highest `invis` 44.6 MB.
 
 Possible next refinement, not done: limit the transmit descriptors the firmware
 keeps pending (`TARGET_NUM_MSDU_DESC`, 2500 per radio today), which hold EDMA
